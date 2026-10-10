@@ -1,0 +1,14 @@
+Language: Cpp
+BasedOnStyle: Google
+IndentWidth: 4
+ColumnLimit: 100
+SortIncludes: false
+AllowShortFunctionsOnASingleLine: Empty
+AlignConsecutiveAssignments: true
+AlignConsecutiveDeclarations: true
+PointerAlignment: Right
+BreakBeforeBraces: Attach
+IndentCaseLabels: true
+# Keep embedded macros and ISR definitions formatted cleanly
+IncludeBlocks: Preserve
+InsertNewlineAtEOF: true

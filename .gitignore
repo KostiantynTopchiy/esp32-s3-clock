@@ -1,0 +1,21 @@
+# Build directories and generated files
+build/
+.pio/
+CMakeCache.txt
+CMakeFiles/
+Makefile
+*.cmake
+*.o
+*.elf
+*.bin
+*.hex
+*.map
+*.su
+
+# IDE and OS specific files
+hw_*/.vscode/*
+.vscode/*
+!.vscode/
+!.vscode/extensions.json
+.DS_Store
+Thumbs.db
