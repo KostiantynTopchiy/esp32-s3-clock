@@ -19,3 +19,5 @@ hw_*/.vscode/*
 !.vscode/extensions.json
 .DS_Store
 Thumbs.db
+
+include/secrets.h
