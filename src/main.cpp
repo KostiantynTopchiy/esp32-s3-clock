@@ -3,6 +3,7 @@
 #include <SPI.h>
 #include <WiFi.h>
 #include <time.h>
+#include <esp_sntp.h>
 #include <Adafruit_BME280.h>
 #include <Adafruit_GFX.h>
 #include <Adafruit_ST7789.h>
@@ -26,12 +27,33 @@ constexpr int LIGHT_BRIGHT = 3600;
 constexpr uint8_t MIN_BRIGHTNESS = 46;
 constexpr uint8_t MAX_BRIGHTNESS = 255;
 
+constexpr unsigned long TIME_SYNC_INTERVAL_MS = 6UL * 60UL * 60UL * 1000UL;
+constexpr unsigned long TIME_SYNC_RETRY_MS    = 15UL * 60UL * 1000UL;
+constexpr unsigned long WIFI_TIMEOUT_MS       = 20000UL;
+constexpr unsigned long NTP_TIMEOUT_MS        = 30000UL;
+
 constexpr char TIME_ZONE[] = "EET-2EEST,M3.5.0/3,M10.5.0/4";
 
 Adafruit_ST7789 display = Adafruit_ST7789(TFT_CS, TFT_DC, TFT_MOSI, TFT_SCLK, TFT_RST);
 U8G2_FOR_ADAFRUIT_GFX ukrainianFont;
 Adafruit_BME280 bme;
 bool bmeReady = false;
+
+enum class TimeSyncState : uint8_t {
+    IDLE,
+    CONNECTING_WIFI,
+    WAITING_FOR_NTP
+};
+
+TimeSyncState timeSyncState = TimeSyncState::IDLE;
+unsigned long timeSyncStateStartedMillis = 0;
+unsigned long lastTimeSyncAttemptMillis  = 0;
+unsigned long nextTimeSyncIntervalMillis = 0;
+volatile bool ntpSyncCompleted = false;
+bool clockHasValidTime = false;
+int previousDisplayedMinute = -1;
+int previousDisplayedDay    = -1;
+bool timeErrorDisplayed     = false;
 
 const char *const WEEKDAYS[] = {
     "Неділя",
@@ -43,7 +65,8 @@ const char *const WEEKDAYS[] = {
     "Субота"
 };
 
-int previousSecond = -1;
+void updateClock();
+void updateRoomClimate();
 
 void drawCenteredText(const char *text, int16_t y, uint8_t size, uint16_t color,
                       uint16_t background = ST77XX_WHITE) {
@@ -75,22 +98,6 @@ void drawCenteredUkrainianText(const char *text, int16_t baselineY, uint16_t col
     ukrainianFont.print(text);
 }
 
-bool connectWiFi() {
-    WiFi.mode(WIFI_STA);
-    WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
-
-    display.fillScreen(ST77XX_WHITE);
-    drawCenteredText("CONNECTING", 130, 2, ST77XX_BLUE);
-
-    const uint32_t startedAt = millis();
-
-    while (WiFi.status() != WL_CONNECTED && millis() - startedAt < 20000) {
-        delay(250);
-    }
-
-    return WiFi.status() == WL_CONNECTED;
-}
-
 void drawClockFace() {
     display.fillScreen(ST77XX_WHITE);
 
@@ -98,14 +105,104 @@ void drawClockFace() {
 
     display.drawRoundRect(4, 4, display.width() - 8, display.height() - 8, 13, ST77XX_RED);
 
+    drawCenteredUkrainianText("Я Батюня в цій хатюні!", 132, ST77XX_BLUE);
+
+    // Everything was cleared, so all dynamic clock fields must be redrawn.
+    previousDisplayedMinute = -1;
+    previousDisplayedDay    = -1;
+    timeErrorDisplayed      = false;
+}
+
+void onNtpTimeSynchronized(struct timeval *timeValue) {
+    ntpSyncCompleted = true;
+}
+
+void turnOffWiFi() {
+    WiFi.disconnect(true);
+    WiFi.mode(WIFI_OFF);
+}
+
+void startTimeSynchronization(unsigned long currentMillis) {
+    ntpSyncCompleted = false;
+
+    // Consume a completed status from the previous synchronization, if present.
+    static_cast<void>(sntp_get_sync_status());
+
+    configTzTime(
+        TIME_ZONE,
+        "pool.ntp.org",
+        "time.google.com",
+        "time.cloudflare.com"
+    );
+
+    WiFi.mode(WIFI_STA);
+    WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+
+    timeSyncState              = TimeSyncState::CONNECTING_WIFI;
+    timeSyncStateStartedMillis = currentMillis;
+
+    Serial.println("Starting Wi-Fi time synchronization");
+}
+
+void finishTimeSynchronization(bool success, unsigned long currentMillis) {
+    turnOffWiFi();
+
+    timeSyncState              = TimeSyncState::IDLE;
+    lastTimeSyncAttemptMillis  = currentMillis;
+    nextTimeSyncIntervalMillis = success ? TIME_SYNC_INTERVAL_MS : TIME_SYNC_RETRY_MS;
+
+    if (success) {
+        Serial.println("Time synchronized; Wi-Fi turned off");
+
+        if (!clockHasValidTime) {
+            clockHasValidTime = true;
+            drawClockFace();
+            updateClock();
+            updateRoomClimate();
+        }
+    } else {
+        Serial.println("Time synchronization failed; retry in 15 minutes");
+    }
+}
+
+void updateTimeSynchronization(unsigned long currentMillis) {
+    switch (timeSyncState) {
+        case TimeSyncState::IDLE:
+            if (currentMillis - lastTimeSyncAttemptMillis >= nextTimeSyncIntervalMillis) {
+                startTimeSynchronization(currentMillis);
+            }
+            break;
+
+        case TimeSyncState::CONNECTING_WIFI:
+            if (WiFi.status() == WL_CONNECTED) {
+                Serial.print("Wi-Fi connected, IP: ");
+                Serial.println(WiFi.localIP());
+
+                timeSyncState              = TimeSyncState::WAITING_FOR_NTP;
+                timeSyncStateStartedMillis = currentMillis;
+            } else if (currentMillis - timeSyncStateStartedMillis >= WIFI_TIMEOUT_MS) {
+                finishTimeSynchronization(false, currentMillis);
+            }
+            break;
+
+        case TimeSyncState::WAITING_FOR_NTP:
+        {
+            const bool sntpReportsCompletion =
+                sntp_get_sync_status() == SNTP_SYNC_STATUS_COMPLETED;
+            const bool initialSystemTimeIsValid =
+                !clockHasValidTime && time(nullptr) > 1483228800;
+
+            if (ntpSyncCompleted || sntpReportsCompletion || initialSystemTimeIsValid) {
+                finishTimeSynchronization(true, currentMillis);
+            } else if (currentMillis - timeSyncStateStartedMillis >= NTP_TIMEOUT_MS) {
+                finishTimeSynchronization(false, currentMillis);
+            }
+            break;
+        }
+    }
 }
 
 void updateClock() {
-    static int  previousMinute     = -1;
-    static int  previousSecond     = -1;
-    static int  previousDay        = -1;
-    static bool timeErrorDisplayed = false;
-
     tm timeInfo{};
 
     if (!getLocalTime(&timeInfo, 100)) {
@@ -120,8 +217,8 @@ void updateClock() {
 
     timeErrorDisplayed = false;
 
-    if (timeInfo.tm_min != previousMinute) {
-        previousMinute = timeInfo.tm_min;
+    if (timeInfo.tm_min != previousDisplayedMinute) {
+        previousDisplayedMinute = timeInfo.tm_min;
 
         char timeText[6];
         strftime(timeText, sizeof(timeText), "%H:%M", &timeInfo);
@@ -129,17 +226,8 @@ void updateClock() {
         drawCenteredText(timeText, 50, 6, ST77XX_BLACK);
     }
 
-    if (timeInfo.tm_sec != previousSecond) {
-        previousSecond = timeInfo.tm_sec;
-
-        char secondsText[3];
-        strftime(secondsText, sizeof(secondsText), "%S", &timeInfo);
-
-        drawCenteredText(secondsText, 110, 3, ST77XX_BLUE);
-    }
-
-    if (timeInfo.tm_yday != previousDay) {
-        previousDay = timeInfo.tm_yday;
+    if (timeInfo.tm_yday != previousDisplayedDay) {
+        previousDisplayedDay = timeInfo.tm_yday;
 
         char dateText[16];
 
@@ -205,16 +293,10 @@ void updateBacklight() {
 
     setBacklightBrightness(brightness);
 
-    Serial.print("Light: ");
-    Serial.print(rawLightLevel);
-    Serial.print(" | Brightness: ");
-    Serial.print((static_cast<unsigned int>(brightness) * 100U) / 255U);
-    Serial.println("%");
 }
 
 void setup() {
     Serial.begin(115200);
-    delay(1000);
 
     pinMode(LDR_PIN, INPUT);
     analogReadResolution(12);
@@ -246,31 +328,14 @@ void setup() {
     ukrainianFont.setFontDirection(0);
     ukrainianFont.setFont(u8g2_font_unifont_t_cyrillic);
 
-    if (!connectWiFi()) {
-        display.fillScreen(ST77XX_WHITE);
-        drawCenteredText("WIFI ERROR", 140, 3, ST77XX_RED);
-        Serial.println("Wi-Fi connection failed");
-        return;
-    }
-
-    Serial.print("Connected, IP: ");
-    Serial.println(WiFi.localIP());
-
-    configTzTime(TIME_ZONE, "pool.ntp.org", "time.google.com", "time.cloudflare.com");
-
-    tm timeInfo{};
-
-    if (!getLocalTime(&timeInfo, 15000)) {
-        display.fillScreen(ST77XX_WHITE);
-        drawCenteredText("NTP ERROR", 140, 3, ST77XX_RED);
-        Serial.println("NTP synchronization failed");
-        return;
-    }
+    sntp_set_time_sync_notification_cb(onNtpTimeSynchronized);
 
     drawClockFace();
     updateClock();
     updateRoomClimate();
     updateBacklight();
+
+    updateTimeSynchronization(millis());
 }
 
 void loop() {
@@ -283,6 +348,8 @@ void loop() {
     constexpr unsigned long LIGHT_INTERVAL_MS   = 500;
 
     const unsigned long currentMillis = millis();
+
+    updateTimeSynchronization(currentMillis);
 
     if (currentMillis - previousClockUpdate >= CLOCK_INTERVAL_MS) {
         previousClockUpdate = currentMillis;
